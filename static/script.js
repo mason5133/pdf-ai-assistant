@@ -28,6 +28,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let isProcessing = false;
     let mdPaneVisible = true;
     let turnCount = 0;
+    let isCached = false;
 
     // Configure marked
     marked.setOptions({ breaks: true, gfm: true });
@@ -91,10 +92,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
             // Populate
             docName.textContent = selectedFile.name;
+            isCached = data.cached || false;
+            const cacheTag = isCached ? ' · Cached' : '';
             if (data.truncated) {
-                docMeta.textContent = `(Partial: ${(data.loaded_chars / 1000).toFixed(0)}K of ${(data.doc_chars / 1000).toFixed(0)}K chars loaded)`;
+                docMeta.textContent = `(Partial: ${(data.loaded_chars / 1000).toFixed(0)}K of ${(data.doc_chars / 1000).toFixed(0)}K chars loaded${cacheTag})`;
             } else {
-                docMeta.textContent = `(${(data.doc_chars / 1000).toFixed(0)}K chars)`;
+                docMeta.textContent = `(${(data.doc_chars / 1000).toFixed(0)}K chars${cacheTag})`;
             }
 
             markdownContent.innerHTML = marked.parse(data.markdown || 'No content extracted.');
@@ -160,6 +163,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             appendMessage('ai', data.ai_response);
             turnCount = data.history_turns || turnCount + 1;
+            if (data.cached !== undefined) isCached = data.cached;
             updateTurnCounter();
 
         } catch (error) {
@@ -350,6 +354,7 @@ document.addEventListener('DOMContentLoaded', () => {
         currentSessionId = null;
         selectedFile = null;
         turnCount = 0;
+        isCached = false;
 
         dropZone.querySelector('p').innerHTML = 'Drag & Drop your PDF here, or <span class="browse-link">browse</span>';
         uploadBtn.disabled = true;

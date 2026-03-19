@@ -1,7 +1,10 @@
 import os
+import re
 import shutil
 import time
 import uuid
+import datetime
+
 from flask import Flask, request, jsonify, render_template
 import opendataloader_pdf
 from google import genai
@@ -10,7 +13,7 @@ from google.genai import types
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-# Directories
+# ─── Directories ──────────────────────────────────────────
 UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), 'uploads')
 OUTPUT_FOLDER = os.path.join(os.path.dirname(__file__), 'outputs')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -20,16 +23,23 @@ app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max upload
 
-# In-memory store: { session_id: { "markdown", "history", "doc_context", "filename" } }
+# ─── In-memory session store ──────────────────────────────
+# { session_id: { markdown, doc_context, filename, history, cache_name, model } }
 chat_sessions = {}
 
+# ─── Model & context config ──────────────────────────────
 MODEL_ID = "gemini-2.5-flash"
 
-# Context management constants
+# Context limits
 MAX_CONTEXT_CHARS = 200_000       # ~50K tokens for document context
 MAX_HISTORY_TURNS = 20            # Keep last N turn-pairs before summarizing
 SUMMARY_TRIGGER = 16              # Summarize when history reaches this many turn-pairs
 
+# Cache settings
+CACHE_TTL_SECONDS = 3600          # 1 hour default TTL for context caches
+CACHE_MIN_CHARS = 4000            # Minimum doc size to attempt caching (~1K tokens)
+
+# ─── System instruction ──────────────────────────────────
 SYSTEM_INSTRUCTION = """You are an intelligent document assistant.
 You have been given a document that was converted from PDF to structured Markdown.
 Your job is to help the user understand, learn from, and work with this document — regardless of its topic.
@@ -50,6 +60,70 @@ def get_gemini_client():
     """Initialize and return a Gemini client."""
     return genai.Client()
 
+
+# ─── Context caching helpers ─────────────────────────────
+
+def create_context_cache(client, doc_text, model=MODEL_ID):
+    """Create a Gemini context cache for the document text.
+    Returns the cache name string, or None if caching fails/not applicable."""
+    if len(doc_text) < CACHE_MIN_CHARS:
+        print(f"Document too short for caching ({len(doc_text)} chars < {CACHE_MIN_CHARS})")
+        return None
+
+    try:
+        cache = client.caches.create(
+            model=model,
+            config=types.CreateCachedContentConfig(
+                system_instruction=SYSTEM_INSTRUCTION,
+                contents=[
+                    types.Content(
+                        role="user",
+                        parts=[types.Part.from_text(
+                            text=f"Here is the document content for reference:\n\n{doc_text}"
+                        )]
+                    ),
+                    types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(
+                            text="I have loaded and analyzed the document. I'm ready to help you understand and work with this content. What would you like to know?"
+                        )]
+                    )
+                ],
+                ttl=f"{CACHE_TTL_SECONDS}s",
+            )
+        )
+        print(f"Context cache created: {cache.name} (TTL: {CACHE_TTL_SECONDS}s)")
+        return cache.name
+    except Exception as e:
+        print(f"Context caching failed (will use inline context): {e}")
+        return None
+
+
+def refresh_cache_ttl(client, cache_name):
+    """Refresh the TTL on an existing cache. Returns True if successful."""
+    try:
+        client.caches.update(
+            name=cache_name,
+            config=types.UpdateCachedContentConfig(
+                ttl=f"{CACHE_TTL_SECONDS}s"
+            )
+        )
+        return True
+    except Exception as e:
+        print(f"Cache TTL refresh failed: {e}")
+        return False
+
+
+def delete_cache(client, cache_name):
+    """Delete a context cache. Silently ignores errors."""
+    try:
+        client.caches.delete(cache_name)
+        print(f"Cache deleted: {cache_name}")
+    except Exception:
+        pass
+
+
+# ─── History & context helpers ───────────────────────────
 
 def build_genai_history(history_list):
     """Convert stored history into google-genai Content objects."""
@@ -76,15 +150,12 @@ def truncate_content(text, max_chars=MAX_CONTEXT_CHARS):
     return truncated, True
 
 
-def summarize_history(client, history, doc_context_preview):
-    """Summarize older conversation turns to keep context window manageable.
-    Returns a condensed summary string of the conversation so far."""
-    # Take all but the last 4 turn-pairs to summarize
+def summarize_history(client, history, model=MODEL_ID):
+    """Summarize older conversation turns to keep context window manageable."""
     to_summarize = history[:-8] if len(history) > 8 else history
     conversation_text = ""
     for entry in to_summarize:
         role_label = "User" if entry["role"] == "user" else "Assistant"
-        # Truncate individual messages in the summary input
         msg_text = entry["text"][:2000] + "..." if len(entry["text"]) > 2000 else entry["text"]
         conversation_text += f"{role_label}: {msg_text}\n\n"
 
@@ -97,27 +168,21 @@ Conversation:
 
     try:
         response = client.models.generate_content(
-            model=MODEL_ID,
+            model=model,
             contents=summary_prompt
         )
         return response.text
     except Exception:
-        # If summarization fails, just return a truncated version
         return conversation_text[:3000]
 
 
 def manage_history(client, session_data):
-    """Check if history needs summarization and handle it.
-    Returns the effective history list to use for the next API call."""
+    """Check if history needs summarization and handle it."""
     history = session_data["history"]
     turn_pairs = len(history) // 2
 
     if turn_pairs >= SUMMARY_TRIGGER:
-        # Summarize older turns
-        doc_preview = session_data.get("doc_context", "")[:1000]
-        summary = summarize_history(client, history, doc_preview)
-
-        # Replace history: summary as first exchange + recent turns
+        summary = summarize_history(client, history)
         summary_entry = {
             "role": "user",
             "text": f"[Previous conversation summary]: {summary}"
@@ -126,8 +191,6 @@ def manage_history(client, session_data):
             "role": "model",
             "text": "I have the context from our previous discussion. Please continue with your questions."
         }
-
-        # Keep the last 8 entries (4 turn-pairs)
         recent = history[-8:]
         session_data["history"] = [summary_entry, ack_entry] + recent
 
@@ -149,6 +212,13 @@ def call_gemini_with_retry(func, max_retries=2, base_wait=50):
                 raise
 
 
+def strip_base64_images(markdown_text):
+    """Strip base64 image data from markdown, keep descriptive placeholders."""
+    return re.sub(r'!\[([^\]]*)\]\(data:image[^\)]+\)', r'[Image: \1]', markdown_text)
+
+
+# ─── Routes ──────────────────────────────────────────────
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -156,7 +226,7 @@ def index():
 
 @app.route('/upload', methods=['POST'])
 def upload_pdf():
-    """Upload and parse a PDF, then get initial AI analysis."""
+    """Upload and parse a PDF, create context cache, get initial AI analysis."""
     try:
         client = get_gemini_client()
     except Exception as e:
@@ -177,8 +247,10 @@ def upload_pdf():
     file.save(filepath)
 
     out_dir = None
+    cache_name = None
+
     try:
-        # 1. Parse PDF with OpenDataLoader (with image embedding)
+        # ── 1. Parse PDF with OpenDataLoader ─────────────────
         print(f"Parsing {filename} with OpenDataLoader PDF...")
         run_id = str(uuid.uuid4())
         out_dir = os.path.join(app.config['OUTPUT_FOLDER'], run_id)
@@ -213,15 +285,19 @@ def upload_pdf():
         if not markdown_content.strip():
             return jsonify({'error': 'PDF parsed but no text content was extracted.'}), 500
 
-        # Full markdown for display; stripped version for AI (remove base64 images)
+        # Full markdown for display panel
         full_markdown = markdown_content
 
-        # Strip base64 image data from context sent to LLM (saves tokens)
-        import re
-        ai_text = re.sub(r'!\[([^\]]*)\]\(data:image[^\)]+\)', r'[Image: \1]', markdown_content)
+        # AI context: strip base64 images (saves tokens), then truncate
+        ai_text = strip_base64_images(markdown_content)
         ai_context, was_truncated = truncate_content(ai_text)
 
-        # 2. Create chat session
+        # ── 2. Create context cache ──────────────────────────
+        # Cache the OpenDataLoader-extracted text for efficient multi-turn chat
+        cache_name = create_context_cache(client, ai_context)
+        using_cache = cache_name is not None
+
+        # ── 3. Initial AI analysis ───────────────────────────
         session_id = str(uuid.uuid4())
 
         truncation_note = ""
@@ -234,36 +310,53 @@ def upload_pdf():
                 f"Let the user know and offer to discuss specific sections or chapters.\n"
             )
 
-        initial_prompt = f"""Here is a document extracted from the PDF "{filename}".{truncation_note}
-Please analyze it and provide:
-1. A clear summary of what this document covers
-2. Key information worth highlighting (dates, figures, names, definitions, formulas, rules — whatever is relevant to this subject)
-3. Any structured data presented clearly (tables, timelines, lists)
-4. A few suggested questions the user might want to explore
+        initial_question = (
+            f'The user just uploaded "{filename}".{truncation_note}\n'
+            f'Please analyze the document and provide:\n'
+            f'1. A clear summary of what this document covers\n'
+            f'2. Key information worth highlighting (dates, figures, names, definitions, formulas, rules — whatever is relevant)\n'
+            f'3. Any structured data presented clearly (tables, timelines, lists)\n'
+            f'4. A few suggested questions the user might want to explore'
+        )
+
+        if using_cache:
+            # Use cached context — document is already in the cache
+            response = call_gemini_with_retry(lambda: client.models.generate_content(
+                model=MODEL_ID,
+                contents=initial_question,
+                config=types.GenerateContentConfig(
+                    cached_content=cache_name,
+                    temperature=0.4,
+                    max_output_tokens=8192,
+                )
+            ))
+        else:
+            # Fallback: send doc inline (no cache available)
+            full_prompt = f"""{initial_question}
 
 Document Content:
 ---
 {ai_context}
 ---"""
+            response = call_gemini_with_retry(lambda: client.models.generate_content(
+                model=MODEL_ID,
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.4,
+                    max_output_tokens=8192,
+                )
+            ))
 
-        chat = client.chats.create(
-            model=MODEL_ID,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION
-            )
-        )
-
-        response = call_gemini_with_retry(
-            lambda: chat.send_message(initial_prompt)
-        )
-
-        # Store session with document context for future reference
+        # ── 4. Store session ─────────────────────────────────
         chat_sessions[session_id] = {
             "markdown": full_markdown,
             "doc_context": ai_context,
             "filename": filename,
+            "cache_name": cache_name,
+            "model": MODEL_ID,
             "history": [
-                {"role": "user", "text": initial_prompt},
+                {"role": "user", "text": initial_question},
                 {"role": "model", "text": response.text}
             ]
         }
@@ -274,12 +367,16 @@ Document Content:
             'ai_response': response.text,
             'truncated': was_truncated,
             'doc_chars': len(ai_text),
-            'loaded_chars': len(ai_context)
+            'loaded_chars': len(ai_context),
+            'cached': using_cache,
         })
 
     except Exception as e:
         import traceback
         traceback.print_exc()
+        # Clean up cache on error
+        if cache_name:
+            delete_cache(get_gemini_client(), cache_name)
         return jsonify({'error': str(e)}), 500
     finally:
         if os.path.exists(filepath):
@@ -310,23 +407,53 @@ def chat_message():
         return jsonify({'error': f"Gemini API init failed: {str(e)}"}), 500
 
     session_data = chat_sessions[session_id]
+    cache_name = session_data.get("cache_name")
 
     try:
         # Manage history length (summarize if needed)
         effective_history = manage_history(client, session_data)
-        history_contents = build_genai_history(effective_history)
 
-        chat = client.chats.create(
-            model=MODEL_ID,
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION
-            ),
-            history=history_contents
-        )
+        if cache_name:
+            # ── Cached path: refresh TTL and use cache ────────
+            refresh_cache_ttl(client, cache_name)
 
-        response = call_gemini_with_retry(
-            lambda: chat.send_message(message)
-        )
+            # Build history for the cached context chat
+            history_contents = build_genai_history(effective_history)
+
+            # Add the new user message
+            history_contents.append(
+                types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=message)]
+                )
+            )
+
+            response = call_gemini_with_retry(lambda: client.models.generate_content(
+                model=MODEL_ID,
+                contents=history_contents,
+                config=types.GenerateContentConfig(
+                    cached_content=cache_name,
+                    temperature=0.4,
+                    max_output_tokens=8192,
+                )
+            ))
+        else:
+            # ── Fallback: inline context (no cache) ──────────
+            history_contents = build_genai_history(effective_history)
+
+            chat = client.chats.create(
+                model=MODEL_ID,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.4,
+                    max_output_tokens=8192,
+                ),
+                history=history_contents
+            )
+
+            response = call_gemini_with_retry(
+                lambda: chat.send_message(message)
+            )
 
         # Append to stored history
         session_data["history"].append({"role": "user", "text": message})
@@ -334,22 +461,37 @@ def chat_message():
 
         return jsonify({
             'ai_response': response.text,
-            'history_turns': len(session_data["history"]) // 2
+            'history_turns': len(session_data["history"]) // 2,
+            'cached': cache_name is not None,
         })
 
     except Exception as e:
         import traceback
         traceback.print_exc()
+
+        # If cache error, try to invalidate and fall back
+        if cache_name and ('cache' in str(e).lower() or 'not found' in str(e).lower()):
+            print("Cache appears invalid, clearing for next request")
+            session_data["cache_name"] = None
+
         return jsonify({'error': str(e)}), 500
 
 
 @app.route('/reset', methods=['POST'])
 def reset_session():
-    """Clear a chat session."""
+    """Clear a chat session and delete its context cache."""
     data = request.get_json()
     session_id = data.get('session_id') if data else None
     if session_id and session_id in chat_sessions:
-        del chat_sessions[session_id]
+        session_data = chat_sessions.pop(session_id)
+        # Clean up the context cache
+        cache_name = session_data.get("cache_name")
+        if cache_name:
+            try:
+                client = get_gemini_client()
+                delete_cache(client, cache_name)
+            except Exception:
+                pass
     return jsonify({'status': 'ok'})
 
 
@@ -366,6 +508,7 @@ def session_info():
         'filename': s.get('filename', 'Unknown'),
         'history_turns': len(s["history"]) // 2,
         'doc_chars': len(s.get('doc_context', '')),
+        'cached': s.get('cache_name') is not None,
     })
 
 

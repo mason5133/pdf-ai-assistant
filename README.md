@@ -6,6 +6,7 @@ Upload any PDF document, get structured Markdown extraction via [OpenDataLoader 
 
 - **PDF to Markdown** — Extracts text, tables, headings, structure, and embedded images from PDFs using OpenDataLoader (runs locally, no API calls)
 - **AI Chat** — Multi-turn conversation powered by Google Gemini (`google-genai` SDK) with full document context
+- **Context Caching** — Document context is cached via Gemini's caching API on first upload, so subsequent chat turns don't resend the full document (faster responses, lower token usage)
 - **Any Topic** — Works with legal documents, textbooks, research papers, manuals, equipment specs, or anything else
 - **Responsive Split View** — Side-by-side extracted content and AI chat, fully resizable
 - **Collapsible Panels** — Hide/show the extracted content pane to go full-screen chat (Ctrl+B toggle)
@@ -13,9 +14,27 @@ Upload any PDF document, get structured Markdown extraction via [OpenDataLoader 
 - **Conversation Memory** — Auto-summarizes older turns to keep long conversations within token limits
 - **Image Embedding** — Extracts and embeds images from PDFs as Base64 JPEG in the Markdown viewer
 - **Rate Limit Handling** — Automatic retry with backoff on 429 errors
+- **Graceful Fallback** — If context caching is unavailable, the app automatically falls back to inline context passing
 - **Mobile Responsive** — Stacked layout on small screens, touch-friendly
 - **Copy Messages** — One-click copy on AI responses
 - **Keyboard Shortcuts** — Ctrl+B toggle panels, Enter to send, Escape to focus chat
+
+## Architecture
+
+```
+User uploads PDF
+       │
+       ├─► OpenDataLoader convert() → Markdown → Display in preview panel
+       │
+       └─► Gemini Context Caching (cache once, reuse every turn)
+                │
+                └─► All chat turns reference cache (no document resending)
+```
+
+OpenDataLoader is the primary extraction engine. Its high-quality Markdown output (tables, structure, embedded images) is:
+1. Shown in the left panel for the user to browse
+2. Cached as context for the AI via Gemini's caching API
+3. Used as fallback inline context if caching is unavailable
 
 ## Requirements
 
@@ -43,11 +62,13 @@ Upload any PDF document, get structured Markdown extraction via [OpenDataLoader 
 
 - **Backend:** Flask (Python)
 - **PDF Parsing:** [opendataloader-pdf](https://pypi.org/project/opendataloader-pdf/) (local, deterministic, no GPU)
-- **AI:** [google-genai](https://pypi.org/project/google-genai/) 1.68.0 (Gemini 2.5 Flash)
+- **AI:** [google-genai](https://pypi.org/project/google-genai/) 1.68.0 (Gemini 2.5 Flash) with context caching
 - **Frontend:** Vanilla HTML/CSS/JS with [Marked.js](https://marked.js.org/) for Markdown rendering
 
 ## Notes on Large Documents
 
 - Documents exceeding ~200K characters are automatically truncated for AI context (the full text still shows in the viewer)
 - The free Gemini API tier has a 250K token/minute limit — large textbooks may need a paid tier
+- Context caching has a minimum threshold (~4K characters) — very small documents use inline context instead
+- Cache TTL defaults to 1 hour; refreshed on each chat message
 - Long conversations auto-summarize older turns to keep context fresh
