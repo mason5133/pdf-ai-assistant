@@ -21,7 +21,7 @@ app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
 # In-memory store: { session_id: { "markdown": str, "history": [{role, text}] } }
 chat_sessions = {}
 
-MODEL_ID = "gemini-2.5-flash-preview-05-20"
+MODEL_ID = "gemini-2.5-flash"
 
 SYSTEM_INSTRUCTION = """You are an intelligent document assistant.
 You have been given a document that was converted from PDF to structured Markdown.
