@@ -18,15 +18,17 @@ os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max upload
 
-# In-memory store: { session_id: { "markdown": str, "history": [{role, text}] } }
+# In-memory store: { session_id: { "markdown", "history", "doc_context", "filename" } }
 chat_sessions = {}
 
 MODEL_ID = "gemini-2.5-flash"
 
-# Max characters to send to Gemini (roughly ~60K tokens at ~4 chars/token = ~240K chars)
-# Free tier limit is 250K input tokens/min, so we stay well under
-MAX_CONTEXT_CHARS = 200_000
+# Context management constants
+MAX_CONTEXT_CHARS = 200_000       # ~50K tokens for document context
+MAX_HISTORY_TURNS = 20            # Keep last N turn-pairs before summarizing
+SUMMARY_TRIGGER = 16              # Summarize when history reaches this many turn-pairs
 
 SYSTEM_INSTRUCTION = """You are an intelligent document assistant.
 You have been given a document that was converted from PDF to structured Markdown.
@@ -41,7 +43,7 @@ Key behaviors:
 - If the user asks about something not covered in the document, say so honestly.
 - Be conversational, helpful, and thorough — the user is here to learn and work with this content.
 - Adapt your tone and depth to match the subject matter (technical, casual, academic, legal, etc.).
-- If the document was truncated due to size, mention that only a portion was loaded and suggest the user ask about specific sections."""
+- If the document was truncated due to size, mention that only a portion was loaded and suggest the user ask about specific sections or topics."""
 
 
 def get_gemini_client():
@@ -63,15 +65,73 @@ def build_genai_history(history_list):
 
 
 def truncate_content(text, max_chars=MAX_CONTEXT_CHARS):
-    """Truncate document text to stay within token limits."""
+    """Truncate document text to stay within token limits.
+    Tries to break at a paragraph boundary for cleaner context."""
     if len(text) <= max_chars:
         return text, False
     truncated = text[:max_chars]
-    # Try to cut at a paragraph break to avoid mid-sentence truncation
     last_break = truncated.rfind('\n\n')
     if last_break > max_chars * 0.8:
         truncated = truncated[:last_break]
     return truncated, True
+
+
+def summarize_history(client, history, doc_context_preview):
+    """Summarize older conversation turns to keep context window manageable.
+    Returns a condensed summary string of the conversation so far."""
+    # Take all but the last 4 turn-pairs to summarize
+    to_summarize = history[:-8] if len(history) > 8 else history
+    conversation_text = ""
+    for entry in to_summarize:
+        role_label = "User" if entry["role"] == "user" else "Assistant"
+        # Truncate individual messages in the summary input
+        msg_text = entry["text"][:2000] + "..." if len(entry["text"]) > 2000 else entry["text"]
+        conversation_text += f"{role_label}: {msg_text}\n\n"
+
+    summary_prompt = f"""Summarize this conversation about a document concisely.
+Capture: key topics discussed, questions asked, important findings, and any conclusions.
+Keep it under 500 words. This summary will be used as context for continuing the conversation.
+
+Conversation:
+{conversation_text}"""
+
+    try:
+        response = client.models.generate_content(
+            model=MODEL_ID,
+            contents=summary_prompt
+        )
+        return response.text
+    except Exception:
+        # If summarization fails, just return a truncated version
+        return conversation_text[:3000]
+
+
+def manage_history(client, session_data):
+    """Check if history needs summarization and handle it.
+    Returns the effective history list to use for the next API call."""
+    history = session_data["history"]
+    turn_pairs = len(history) // 2
+
+    if turn_pairs >= SUMMARY_TRIGGER:
+        # Summarize older turns
+        doc_preview = session_data.get("doc_context", "")[:1000]
+        summary = summarize_history(client, history, doc_preview)
+
+        # Replace history: summary as first exchange + recent turns
+        summary_entry = {
+            "role": "user",
+            "text": f"[Previous conversation summary]: {summary}"
+        }
+        ack_entry = {
+            "role": "model",
+            "text": "I have the context from our previous discussion. Please continue with your questions."
+        }
+
+        # Keep the last 8 entries (4 turn-pairs)
+        recent = history[-8:]
+        session_data["history"] = [summary_entry, ack_entry] + recent
+
+    return session_data["history"]
 
 
 def call_gemini_with_retry(func, max_retries=2, base_wait=50):
@@ -118,7 +178,7 @@ def upload_pdf():
 
     out_dir = None
     try:
-        # 1. Parse PDF with OpenDataLoader (using current convert() API)
+        # 1. Parse PDF with OpenDataLoader (with image embedding)
         print(f"Parsing {filename} with OpenDataLoader PDF...")
         run_id = str(uuid.uuid4())
         out_dir = os.path.join(app.config['OUTPUT_FOLDER'], run_id)
@@ -127,7 +187,9 @@ def upload_pdf():
         opendataloader_pdf.convert(
             input_path=filepath,
             output_dir=out_dir,
-            format="markdown"
+            format="markdown",
+            image_output="embedded",
+            image_format="jpeg"
         )
 
         # Read the generated Markdown
@@ -151,23 +213,33 @@ def upload_pdf():
         if not markdown_content.strip():
             return jsonify({'error': 'PDF parsed but no text content was extracted.'}), 500
 
-        # Store the full markdown for display, but truncate for AI context
+        # Full markdown for display; stripped version for AI (remove base64 images)
         full_markdown = markdown_content
-        ai_context, was_truncated = truncate_content(markdown_content)
 
-        # 2. Create a new chat session with Gemini
+        # Strip base64 image data from context sent to LLM (saves tokens)
+        import re
+        ai_text = re.sub(r'!\[([^\]]*)\]\(data:image[^\)]+\)', r'[Image: \1]', markdown_content)
+        ai_context, was_truncated = truncate_content(ai_text)
+
+        # 2. Create chat session
         session_id = str(uuid.uuid4())
 
         truncation_note = ""
         if was_truncated:
-            truncation_note = f"\n\nNOTE: This document is very large ({len(full_markdown):,} characters). Only the first ~{len(ai_context):,} characters are included below. Let the user know and offer to discuss specific sections.\n"
+            total_chars = len(ai_text)
+            loaded_chars = len(ai_context)
+            truncation_note = (
+                f"\n\nNOTE: This document is very large ({total_chars:,} characters). "
+                f"Only the first ~{loaded_chars:,} characters are loaded. "
+                f"Let the user know and offer to discuss specific sections or chapters.\n"
+            )
 
-        initial_prompt = f"""Here is a document that was extracted from a PDF file named "{filename}".{truncation_note}
+        initial_prompt = f"""Here is a document extracted from the PDF "{filename}".{truncation_note}
 Please analyze it and provide:
-1. A clear summary of what this document is about
-2. Key information worth highlighting (dates, figures, names, definitions, rules, formulas — whatever is relevant)
+1. A clear summary of what this document covers
+2. Key information worth highlighting (dates, figures, names, definitions, formulas, rules — whatever is relevant to this subject)
 3. Any structured data presented clearly (tables, timelines, lists)
-4. Suggested questions the user might want to explore
+4. A few suggested questions the user might want to explore
 
 Document Content:
 ---
@@ -185,9 +257,11 @@ Document Content:
             lambda: chat.send_message(initial_prompt)
         )
 
-        # Store session
+        # Store session with document context for future reference
         chat_sessions[session_id] = {
             "markdown": full_markdown,
+            "doc_context": ai_context,
+            "filename": filename,
             "history": [
                 {"role": "user", "text": initial_prompt},
                 {"role": "model", "text": response.text}
@@ -198,7 +272,9 @@ Document Content:
             'session_id': session_id,
             'markdown': full_markdown,
             'ai_response': response.text,
-            'truncated': was_truncated
+            'truncated': was_truncated,
+            'doc_chars': len(ai_text),
+            'loaded_chars': len(ai_context)
         })
 
     except Exception as e:
@@ -236,8 +312,9 @@ def chat_message():
     session_data = chat_sessions[session_id]
 
     try:
-        # Rebuild chat with existing history
-        history_contents = build_genai_history(session_data["history"])
+        # Manage history length (summarize if needed)
+        effective_history = manage_history(client, session_data)
+        history_contents = build_genai_history(effective_history)
 
         chat = client.chats.create(
             model=MODEL_ID,
@@ -255,7 +332,10 @@ def chat_message():
         session_data["history"].append({"role": "user", "text": message})
         session_data["history"].append({"role": "model", "text": response.text})
 
-        return jsonify({'ai_response': response.text})
+        return jsonify({
+            'ai_response': response.text,
+            'history_turns': len(session_data["history"]) // 2
+        })
 
     except Exception as e:
         import traceback
@@ -271,6 +351,22 @@ def reset_session():
     if session_id and session_id in chat_sessions:
         del chat_sessions[session_id]
     return jsonify({'status': 'ok'})
+
+
+@app.route('/session-info', methods=['POST'])
+def session_info():
+    """Return metadata about an active session."""
+    data = request.get_json()
+    session_id = data.get('session_id') if data else None
+    if not session_id or session_id not in chat_sessions:
+        return jsonify({'error': 'No active session'}), 404
+
+    s = chat_sessions[session_id]
+    return jsonify({
+        'filename': s.get('filename', 'Unknown'),
+        'history_turns': len(s["history"]) // 2,
+        'doc_chars': len(s.get('doc_context', '')),
+    })
 
 
 if __name__ == '__main__':
