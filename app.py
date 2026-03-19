@@ -1,5 +1,6 @@
 import os
 import shutil
+import time
 import uuid
 from flask import Flask, request, jsonify, render_template
 import opendataloader_pdf
@@ -23,6 +24,10 @@ chat_sessions = {}
 
 MODEL_ID = "gemini-2.5-flash"
 
+# Max characters to send to Gemini (roughly ~60K tokens at ~4 chars/token = ~240K chars)
+# Free tier limit is 250K input tokens/min, so we stay well under
+MAX_CONTEXT_CHARS = 200_000
+
 SYSTEM_INSTRUCTION = """You are an intelligent document assistant.
 You have been given a document that was converted from PDF to structured Markdown.
 Your job is to help the user understand, learn from, and work with this document — regardless of its topic.
@@ -35,7 +40,8 @@ Key behaviors:
 - Answer follow-up questions using the document as context.
 - If the user asks about something not covered in the document, say so honestly.
 - Be conversational, helpful, and thorough — the user is here to learn and work with this content.
-- Adapt your tone and depth to match the subject matter (technical, casual, academic, legal, etc.)."""
+- Adapt your tone and depth to match the subject matter (technical, casual, academic, legal, etc.).
+- If the document was truncated due to size, mention that only a portion was loaded and suggest the user ask about specific sections."""
 
 
 def get_gemini_client():
@@ -54,6 +60,33 @@ def build_genai_history(history_list):
             )
         )
     return contents
+
+
+def truncate_content(text, max_chars=MAX_CONTEXT_CHARS):
+    """Truncate document text to stay within token limits."""
+    if len(text) <= max_chars:
+        return text, False
+    truncated = text[:max_chars]
+    # Try to cut at a paragraph break to avoid mid-sentence truncation
+    last_break = truncated.rfind('\n\n')
+    if last_break > max_chars * 0.8:
+        truncated = truncated[:last_break]
+    return truncated, True
+
+
+def call_gemini_with_retry(func, max_retries=2, base_wait=50):
+    """Call a Gemini API function with retry on rate limit (429)."""
+    for attempt in range(max_retries + 1):
+        try:
+            return func()
+        except Exception as e:
+            error_str = str(e)
+            if '429' in error_str and attempt < max_retries:
+                wait_time = base_wait * (attempt + 1)
+                print(f"Rate limited. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}...")
+                time.sleep(wait_time)
+            else:
+                raise
 
 
 @app.route('/')
@@ -85,16 +118,16 @@ def upload_pdf():
 
     out_dir = None
     try:
-        # 1. Parse PDF with OpenDataLoader
+        # 1. Parse PDF with OpenDataLoader (using current convert() API)
         print(f"Parsing {filename} with OpenDataLoader PDF...")
         run_id = str(uuid.uuid4())
         out_dir = os.path.join(app.config['OUTPUT_FOLDER'], run_id)
         os.makedirs(out_dir, exist_ok=True)
 
-        opendataloader_pdf.run(
+        opendataloader_pdf.convert(
             input_path=filepath,
-            output_folder=out_dir,
-            generate_markdown=True
+            output_dir=out_dir,
+            format="markdown"
         )
 
         # Read the generated Markdown
@@ -118,10 +151,18 @@ def upload_pdf():
         if not markdown_content.strip():
             return jsonify({'error': 'PDF parsed but no text content was extracted.'}), 500
 
+        # Store the full markdown for display, but truncate for AI context
+        full_markdown = markdown_content
+        ai_context, was_truncated = truncate_content(markdown_content)
+
         # 2. Create a new chat session with Gemini
         session_id = str(uuid.uuid4())
 
-        initial_prompt = f"""Here is a document that was extracted from a PDF file named "{filename}".
+        truncation_note = ""
+        if was_truncated:
+            truncation_note = f"\n\nNOTE: This document is very large ({len(full_markdown):,} characters). Only the first ~{len(ai_context):,} characters are included below. Let the user know and offer to discuss specific sections.\n"
+
+        initial_prompt = f"""Here is a document that was extracted from a PDF file named "{filename}".{truncation_note}
 Please analyze it and provide:
 1. A clear summary of what this document is about
 2. Key information worth highlighting (dates, figures, names, definitions, rules, formulas — whatever is relevant)
@@ -130,7 +171,7 @@ Please analyze it and provide:
 
 Document Content:
 ---
-{markdown_content}
+{ai_context}
 ---"""
 
         chat = client.chats.create(
@@ -139,11 +180,14 @@ Document Content:
                 system_instruction=SYSTEM_INSTRUCTION
             )
         )
-        response = chat.send_message(initial_prompt)
+
+        response = call_gemini_with_retry(
+            lambda: chat.send_message(initial_prompt)
+        )
 
         # Store session
         chat_sessions[session_id] = {
-            "markdown": markdown_content,
+            "markdown": full_markdown,
             "history": [
                 {"role": "user", "text": initial_prompt},
                 {"role": "model", "text": response.text}
@@ -152,8 +196,9 @@ Document Content:
 
         return jsonify({
             'session_id': session_id,
-            'markdown': markdown_content,
-            'ai_response': response.text
+            'markdown': full_markdown,
+            'ai_response': response.text,
+            'truncated': was_truncated
         })
 
     except Exception as e:
@@ -202,7 +247,9 @@ def chat_message():
             history=history_contents
         )
 
-        response = chat.send_message(message)
+        response = call_gemini_with_retry(
+            lambda: chat.send_message(message)
+        )
 
         # Append to stored history
         session_data["history"].append({"role": "user", "text": message})
