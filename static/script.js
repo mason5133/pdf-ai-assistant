@@ -93,7 +93,9 @@ document.addEventListener('DOMContentLoaded', () => {
             // Populate
             docName.textContent = selectedFile.name;
             isCached = data.cached || false;
-            const cacheTag = isCached ? ' · Cached' : '';
+            // "Cached" = explicit context cache (paid tier).
+            // Otherwise inline + implicit caching kicks in automatically on free tier.
+            const cacheTag = isCached ? ' · Cached' : ' · Auto-cached';
             if (data.truncated) {
                 docMeta.textContent = `(Partial: ${(data.loaded_chars / 1000).toFixed(0)}K of ${(data.doc_chars / 1000).toFixed(0)}K chars loaded${cacheTag})`;
             } else {

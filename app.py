@@ -39,6 +39,12 @@ SUMMARY_TRIGGER = 16              # Summarize when history reaches this many tur
 CACHE_TTL_SECONDS = 3600          # 1 hour default TTL for context caches
 CACHE_MIN_CHARS = 4000            # Minimum doc size to attempt caching (~1K tokens)
 
+# Explicit caching requires paid tier (Tier 1+). Free tier gets a 0-token limit.
+# Set ENABLE_EXPLICIT_CACHE=true env var to attempt explicit caching anyway.
+# Implicit caching (90% discount on repeated context) works automatically on free tier
+# as long as the document appears at the start of every request — which we do.
+ENABLE_EXPLICIT_CACHE = os.environ.get("ENABLE_EXPLICIT_CACHE", "").lower() in ("true", "1", "yes")
+
 # ─── System instruction ──────────────────────────────────
 SYSTEM_INSTRUCTION = """You are an intelligent document assistant.
 You have been given a document that was converted from PDF to structured Markdown.
@@ -64,10 +70,22 @@ def get_gemini_client():
 # ─── Context caching helpers ─────────────────────────────
 
 def create_context_cache(client, doc_text, model=MODEL_ID):
-    """Create a Gemini context cache for the document text.
-    Returns the cache name string, or None if caching fails/not applicable."""
+    """Create a Gemini explicit context cache for the document text.
+    Returns the cache name string, or None if caching fails/not applicable.
+
+    NOTE: Explicit caching requires a paid Gemini API tier. Free tier returns
+    429 RESOURCE_EXHAUSTED with limit=0. We skip the attempt unless explicitly
+    enabled via ENABLE_EXPLICIT_CACHE env var.
+
+    Implicit caching (automatic, free tier compatible, 90% discount) handles
+    repeated context as long as the document appears at the start of each
+    request — which our inline path does.
+    """
+    if not ENABLE_EXPLICIT_CACHE:
+        return None
+
     if len(doc_text) < CACHE_MIN_CHARS:
-        print(f"Document too short for caching ({len(doc_text)} chars < {CACHE_MIN_CHARS})")
+        print(f"Document too short for explicit caching ({len(doc_text)} chars < {CACHE_MIN_CHARS})")
         return None
 
     try:
@@ -92,10 +110,14 @@ def create_context_cache(client, doc_text, model=MODEL_ID):
                 ttl=f"{CACHE_TTL_SECONDS}s",
             )
         )
-        print(f"Context cache created: {cache.name} (TTL: {CACHE_TTL_SECONDS}s)")
+        print(f"Explicit context cache created: {cache.name} (TTL: {CACHE_TTL_SECONDS}s)")
         return cache.name
     except Exception as e:
-        print(f"Context caching failed (will use inline context): {e}")
+        err_str = str(e)
+        if "429" in err_str and "FreeTier" in err_str:
+            print("Explicit caching unavailable on free tier — using inline context with implicit caching (90% discount on repeated tokens, automatic).")
+        else:
+            print(f"Explicit context caching failed (will use inline context): {e}")
         return None
 
 
@@ -217,6 +239,22 @@ def strip_base64_images(markdown_text):
     return re.sub(r'!\[([^\]]*)\]\(data:image[^\)]+\)', r'[Image: \1]', markdown_text)
 
 
+def build_doc_prefix(doc_context, filename):
+    """Build the document prefix string used at the start of every chat turn.
+
+    Keeping this BYTE-IDENTICAL across turns is what lets Gemini's implicit
+    caching detect and discount the repeated tokens automatically (90% off on
+    free tier). Do not vary whitespace, headers, or interpolation here.
+    """
+    return (
+        f"=== DOCUMENT CONTEXT ===\n"
+        f"Filename: {filename}\n"
+        f"--- BEGIN DOCUMENT ---\n"
+        f"{doc_context}\n"
+        f"--- END DOCUMENT ---\n\n"
+    )
+
+
 # ─── Routes ──────────────────────────────────────────────
 
 @app.route('/')
@@ -320,7 +358,7 @@ def upload_pdf():
         )
 
         if using_cache:
-            # Use cached context — document is already in the cache
+            # Use explicit cached context — document is already in the cache
             response = call_gemini_with_retry(lambda: client.models.generate_content(
                 model=MODEL_ID,
                 contents=initial_question,
@@ -331,16 +369,13 @@ def upload_pdf():
                 )
             ))
         else:
-            # Fallback: send doc inline (no cache available)
-            full_prompt = f"""{initial_question}
-
-Document Content:
----
-{ai_context}
----"""
+            # Inline path: send doc as the first part of the request.
+            # Structured so Gemini's IMPLICIT caching (free tier compatible, 90%
+            # discount automatic) can detect the repeated document prefix across turns.
+            doc_prefix = build_doc_prefix(ai_context, filename)
             response = call_gemini_with_retry(lambda: client.models.generate_content(
                 model=MODEL_ID,
-                contents=full_prompt,
+                contents=[doc_prefix, initial_question],
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
                     temperature=0.4,
@@ -414,13 +449,11 @@ def chat_message():
         effective_history = manage_history(client, session_data)
 
         if cache_name:
-            # ── Cached path: refresh TTL and use cache ────────
+            # ── Explicit cached path: refresh TTL and use cache ────────
             refresh_cache_ttl(client, cache_name)
 
             # Build history for the cached context chat
             history_contents = build_genai_history(effective_history)
-
-            # Add the new user message
             history_contents.append(
                 types.Content(
                     role="user",
@@ -438,22 +471,41 @@ def chat_message():
                 )
             ))
         else:
-            # ── Fallback: inline context (no cache) ──────────
-            history_contents = build_genai_history(effective_history)
+            # ── Inline path (free tier compatible) ──────────
+            # Reconstruct request: [doc_prefix, prior_history_summary, new_message]
+            # The doc_prefix is byte-identical across turns so Gemini's implicit
+            # caching (90% discount, free) automatically kicks in.
+            doc_context = session_data.get("doc_context", "")
+            filename = session_data.get("filename", "document")
+            doc_prefix = build_doc_prefix(doc_context, filename)
 
-            chat = client.chats.create(
+            # Build a compact conversation history for context (skip the giant
+            # initial_question which embedded the document — we now send the
+            # doc as a separate prefix every turn).
+            conv_lines = []
+            for entry in effective_history[2:]:  # skip first user/model pair (initial analysis)
+                role_label = "User" if entry["role"] == "user" else "Assistant"
+                conv_lines.append(f"{role_label}: {entry['text']}")
+            conv_history = "\n\n".join(conv_lines) if conv_lines else ""
+
+            if conv_history:
+                full_prompt = (
+                    f"{doc_prefix}"
+                    f"=== PRIOR CONVERSATION ===\n{conv_history}\n\n"
+                    f"=== NEW USER MESSAGE ===\n{message}"
+                )
+            else:
+                full_prompt = f"{doc_prefix}=== NEW USER MESSAGE ===\n{message}"
+
+            response = call_gemini_with_retry(lambda: client.models.generate_content(
                 model=MODEL_ID,
+                contents=full_prompt,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
                     temperature=0.4,
                     max_output_tokens=8192,
-                ),
-                history=history_contents
-            )
-
-            response = call_gemini_with_retry(
-                lambda: chat.send_message(message)
-            )
+                )
+            ))
 
         # Append to stored history
         session_data["history"].append({"role": "user", "text": message})
